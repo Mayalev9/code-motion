@@ -33,12 +33,12 @@ code-motion/
 2. **Copy the skill** into your Claude Code skills folder:
 
    ```bash
-   git clone <this repository> /tmp/code-motion
+   git clone https://github.com/Mayalev9/code-motion.git /tmp/code-motion
    mkdir -p ~/.claude/skills
    cp -R /tmp/code-motion/code-motion ~/.claude/skills/
    ```
 
-   (Or download the ZIP and put the `code-motion` folder in `~/.claude/skills/`.)
+   (Or click **Code → Download ZIP** on this page, unzip it, and put the `code-motion` folder in `~/.claude/skills/`.)
 
 3. **Start Claude Code in any project folder** and ask for motion. The first time, Claude copies the engine into a `motion/`
    folder in your project, runs `npm install`, and runs a health check (`node doctor.mjs`) that tells you exactly what to install
