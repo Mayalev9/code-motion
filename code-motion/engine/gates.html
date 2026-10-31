@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<!-- The page is deliberately `dir="rtl"` — that is exactly the condition that caused trap #1,
+     and without it the text gate would always pass and prove nothing. -->
+<head><meta charset="utf-8"><title>gates</title></head>
+<body>
+<script type="module">
+import { renderQuads } from './scenes/_quad3d.js';
+import { resetFrame } from './scenes/_lib.js';
+
+const loadedFonts = new Map();
+
+const px = src => {
+  const c = document.createElement('canvas');
+  c.width = src.width; c.height = src.height;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(src, 0, 0);
+  return x.getImageData(0, 0, c.width, c.height);
+};
+const make = (w, h, fn) => {
+  const c = new OffscreenCanvas(w, h);
+  fn(c.getContext('2d'));
+  return c;
+};
+
+// ── Gate 1 · orientation ──────────────────────────────────────────────
+// An upside-down `up` vector and a camera on the wrong z side both produced mirrored
+// text, and both are caught in four lines: draw a mark in one corner and check where it lands.
+function gateOrientation(inject) {
+  const N = 240;
+  const tex = make(200, 200, x => {
+    x.fillStyle = '#000'; x.fillRect(0, 0, 200, 200);
+    x.fillStyle = '#fff'; x.fillRect(0, 0, 70, 70);      // top-left corner
+  });
+  const eye = inject === 'mirror' ? [0, 0, -300] : [0, 0, 300];
+  const gl = renderQuads(N, N, [{
+    tex, pos: [0, 0, 0], size: [160, 160], rot: [0, 0, 0], alpha: 1,
+  }], { eye, at: [0, 0, 0], fov: 0.58 });
+
+  const d = px(gl).data;
+  const quad = [0, 0, 0, 0];                              // TL TR BL BR
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const v = d[(y * N + x) * 4];
+      const q = (y < N / 2 ? 0 : 2) + (x < N / 2 ? 0 : 1);
+      quad[q] += v;
+    }
+  }
+  const best = quad.indexOf(Math.max(...quad));
+  const names = ['top-left', 'top-right', 'bottom-left', 'bottom-right'];
+  return {
+    pass: best === 0,
+    detail: `the mark landed ${names[best]} (ratio to the next quadrant: ` +
+      `${(quad[0] / Math.max(1, Math.max(quad[1], quad[2]))).toFixed(2)})`,
+  };
+}
+
+// ── Gate 2 · text direction ───────────────────────────────────────────
+// Trap 1: the canvas inherits `direction` from the page. `A Cool Template` showed up as
+// `l Template`. resetFrame pins ltr; this gate checks that it really does.
+function gateTextDirection(inject) {
+  const W = 420, H = 120, X0 = 100;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  document.body.appendChild(c);
+  const x = c.getContext('2d', { willReadFrequently: true });
+  if (inject !== 'skip-reset') resetFrame(x, W, H);
+  x.fillStyle = '#fff';
+  x.font = '40px Helvetica, Arial, sans-serif';
+  // `textAlign` is deliberately left at its default. The default is `start`,
+  // and `start` under `direction:rtl` means right — so the text ENDS at X0
+  // instead of starting there. An earlier version set `textAlign='left'` explicitly
+  // and so immunised itself against the very bug it should catch. Caught by the selftest.
+  x.textBaseline = 'middle';
+  x.fillText('ABCD', X0, H / 2);
+  const d = x.getImageData(0, 0, W, H).data;
+  c.remove();
+  let min = W, max = -1;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (d[(y * W + x) * 4] > 60) { if (x < min) min = x; if (x > max) max = x; }
+    }
+  }
+  const ok = min >= X0 - 12 && min <= X0 + 14 && max > X0;
+  return { pass: ok, detail: `ink from ${min} to ${max}; expected to start at ${X0}` };
+}
+
+// ── Gate 3 · size derived per plane ───────────────────────────────────
+// A size measured on one plane is valid only on that plane. A quad set to "half the frame
+// height" must cover half at every z — otherwise the size was derived from another plane.
+function gatePlaneSize(inject) {
+  const N = 240, EYE0 = 2900, TAN = Math.tan(0.58 / 2);
+  const visAt = z => 2 * (EYE0 - z) * TAN;
+  const white = make(64, 64, x => { x.fillStyle = '#fff'; x.fillRect(0, 0, 64, 64); });
+  const cover = z => {
+    // the bug: derive from a fixed world height instead of from the plane's field of view
+    const s = inject === 'fixed-plane' ? 0.5 * visAt(0) : 0.5 * visAt(z);
+    const gl = renderQuads(N, N, [{ tex: white, pos: [0, 0, z], size: [s, s], rot: [0, 0, 0], alpha: 1 }],
+      { eye: [0, 0, EYE0], at: [0, 0, 0], fov: 0.58 });
+    const d = px(gl).data;
+    let on = 0;
+    for (let i = 0; i < d.length; i += 4) if (d[i] > 128) on++;
+    return on / (N * N);
+  };
+  const a = cover(0), b = cover(-900);
+  const diff = Math.abs(a - b);
+  return {
+    pass: diff < 0.012,
+    detail: `coverage at z=0: ${(a * 100).toFixed(1)}% · at z=-900: ${(b * 100).toFixed(1)}%` +
+      ` · gap ${(diff * 100).toFixed(1)}%`,
+  };
+}
+
+// ── Gates 4–5 · on real scenes ────────────────────────────────────────
+// 4: `draw` must be a pure function of t — without that there is no motion blur.
+// 5: with motion blur the first sub-sample gets a negative t, and every index derived
+//    from t must allow for that. The render crashed ONLY with --mblur.
+async function gateScene(url, base, inject) {
+  const m = await import(url);
+  const S = m.SCENE;
+  const c = document.createElement('canvas');
+  c.width = S.width; c.height = S.height;
+  const x = c.getContext('2d', { alpha: false, willReadFrequently: true });
+
+  const IMG = {};
+  for (const [k, src] of Object.entries(S.images || {})) {
+    IMG[k] = await createImageBitmap(await (await fetch(`${base}/${src}`)).blob());
+  }
+  let AUDIO = null;
+  if (S.audio) AUDIO = await (await fetch(`${base}/${S.audio}`)).json();
+  for (const f of (S.fonts || [])) {
+    const key = `${f.family}\u0000${f.weight || '400'}\u0000${f.style || 'normal'}\u0000${f.src}`;
+    if (!loadedFonts.has(key)) {
+      const face = new FontFace(f.family, `url(${base}/${f.src})`,
+                                { weight: f.weight || '400', style: f.style || 'normal' });
+      loadedFonts.set(key, face.load().then(() => document.fonts.add(face)));
+    }
+    await loadedFonts.get(key);
+  }
+  await document.fonts.ready;
+
+  const draw = (t) => {
+    if (inject === 'negative-index' && t < 0) {
+      const tiles = [0, 1, 2, 3];
+      if (tiles[Math.floor(t * 24) % tiles.length] === undefined)
+        throw new Error('negative index outside the array');
+    }
+    if (inject === 'random') { S.draw(x, t + Math.random() * 1e-3, S.width, S.height, AUDIO, IMG); return; }
+    S.draw(x, t, S.width, S.height, AUDIO, IMG);
+  };
+
+  // negative t — the size of a real motion-blur sub-sample
+  let negT = { pass: true, detail: 'no error thrown at t=-0.0092' };
+  try { draw(-0.0092); } catch (e) { negT = { pass: false, detail: 'crashed: ' + e.message }; }
+
+  // determinism — the same t twice, pixel against pixel
+  const T = Math.min(1.7, S.duration * 0.35);
+  // Warm up, then wait for fonts again. `document.fonts.ready` only waits for loads
+  // already started; a font first used INSIDE the draw starts loading only then.
+  // Without this the first frame renders in a fallback font and the second in the real one.
+  if (inject !== 'no-warmup') { draw(T); await document.fonts.ready; }
+  const snap = () => { draw(T); return x.getImageData(0, 0, S.width, S.height).data.slice(); };
+  const s1 = snap(), s2 = snap(), s3 = snap(), s4 = snap();
+  const changed = (p, q, i) => p[i] !== q[i] || p[i + 1] !== q[i + 1] ||
+    p[i + 2] !== q[i + 2] || p[i + 3] !== q[i + 3];
+  const cnt = (p, q) => { let n = 0; for (let i = 0; i < p.length; i += 4) if (changed(p, q, i)) n++; return n; };
+  const seq = [cnt(s1, s2), cnt(s2, s3), cnt(s3, s4), cnt(s1, s3), cnt(s2, s4)];
+  const a = s3, b = s4;
+  let diff = 0, x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, maxd = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    if (changed(a, b, i)) {
+      const dd = Math.max(...[0, 1, 2, 3].map(k => Math.abs(a[i + k] - b[i + k])));
+      diff++; if (dd > maxd) maxd = dd;
+      const px = (i / 4) % S.width, py = Math.floor((i / 4) / S.width);
+      if (px < x0) x0 = px; if (px > x1) x1 = px;
+      if (py < y0) y0 = py; if (py > y1) y1 = py;
+    }
+  }
+  const det = {
+    pass: diff === 0,
+    detail: diff === 0 ? `identical · sequence ${seq.join('/')}`
+      : `${diff} pixels · box x${x0}..${x1} y${y0}..${y1} · max ${maxd} · sequence ${seq.join('/')}`,
+  };
+  return { name: S.name, negT, det };
+}
+
+window.__gates = async (base, sceneUrls, inject) => {
+  const out = { units: [], scenes: [] };
+  const run = (name, fn, tag) => {
+    try { const r = fn(inject === tag ? tag : null); out.units.push({ name, tag, ...r }); }
+    catch (e) { out.units.push({ name, tag, pass: false, detail: 'crashed: ' + e.message }); }
+  };
+  run('orientation', gateOrientation, 'mirror');
+  run('text direction', gateTextDirection, 'skip-reset');
+  run('per-plane size', gatePlaneSize, 'fixed-plane');
+  for (const u of sceneUrls) {
+    try { out.scenes.push(await gateScene(u, base, inject)); }
+    catch (e) { out.scenes.push({ name: u.split('/').pop(), error: e.message }); }
+  }
+  return out;
+};
+</script>
+</body>
+</html>

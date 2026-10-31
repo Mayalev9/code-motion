@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head><meta charset="utf-8"><title>host</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style></head>
+<body>
+<canvas id="c"></canvas>
+<script type="module">
+let SCENE = null, ctx = null, AUDIO = null, IMAGES = {};
+let SCALE = 1, rawCtx = null, rawActx = null;
+
+/* ── Resolution path ─────────────────────────────────────────────────────
+ * Scenes always draw in LOGICAL space (`SCENE.width × SCENE.height`). At scale>1
+ * the backing store is S× larger and the CTM is scaled, so no scene changes.
+ *
+ * What the CTM does NOT fix: per the Canvas2D spec, `shadowBlur`, `shadowOffsetX/Y`
+ * and `ctx.filter` work in DEVICE space and are not multiplied by the transform.
+ * Without a fix, a 4K render would get shadows and blurs at half the relative
+ * strength — a different picture, not the same picture at higher resolution.
+ * So the fix lives in a Proxy, not in every scene.
+ * `lineWidth`, `setLineDash` and gradients ARE in user space ⇒ they scale by themselves.
+ */
+const SCALED_PROPS = new Set(['shadowBlur', 'shadowOffsetX', 'shadowOffsetY']);
+function scaleFilter(f, S) {
+  if (!f || f === 'none') return f;
+  return String(f).replace(/(-?\d*\.?\d+)px/g, (_, n) => `${(+n * S)}px`);
+}
+function scaleCtx(raw, S) {
+  if (S === 1) return raw;
+  return new Proxy(raw, {
+    get(t, k) {
+      if (k === '__scale') return S;
+      const v = t[k];
+      if (typeof v === 'function') return v.bind(t);
+      if (SCALED_PROPS.has(k)) return v / S;
+      return v;
+    },
+    set(t, k, v) {
+      if (SCALED_PROPS.has(k)) { t[k] = v * S; return true; }
+      if (k === 'filter') { t.filter = scaleFilter(v, S); return true; }
+      t[k] = v; return true;
+    },
+  });
+}
+globalThis.__scaleCtx = scaleCtx;
+function resetCTM() {
+  if (SCALE === 1) return;
+  rawCtx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+}
+const c = document.getElementById('c');
+const acc = document.createElement('canvas');       // accumulator for motion blur
+let actx = null;
+
+window.__load = async (src, audioBase, scale) => {
+  const m = await import(src);
+  SCENE = m.SCENE;
+  SCALE = Math.max(1, Math.round(Number(scale) || 1));
+  globalThis.__SCALE = SCALE;
+  c.width = SCENE.width * SCALE; c.height = SCENE.height * SCALE;
+  acc.width = SCENE.width * SCALE; acc.height = SCENE.height * SCALE;
+  rawCtx = c.getContext('2d', { alpha: false });
+  rawActx = acc.getContext('2d', { alpha: false });
+  ctx = scaleCtx(rawCtx, SCALE);
+  actx = rawActx;                       // the accumulator works in device space only
+  resetCTM();
+  if (SCENE.audio) {
+    AUDIO = await (await fetch(`${audioBase}/${SCENE.audio}`)).json();
+  }
+  // Source images: loaded once and passed to draw as the sixth parameter
+  IMAGES = {};
+  for (const [k, src] of Object.entries(SCENE.images || {})) {
+    const blob = await (await fetch(`${audioBase}/${src}`)).blob();
+    IMAGES[k] = await createImageBitmap(blob);
+  }
+  // Local fonts the scene declares — loaded before the first frame
+  for (const f of (SCENE.fonts || [])) {
+    const face = new FontFace(f.family, `url(${audioBase}/${f.src})`,
+                              { weight: f.weight || '400', style: f.style || 'normal' });
+    document.fonts.add(await face.load());
+  }
+  // The font must load before the first frame, or the first line renders in a fallback font
+  await document.fonts.ready;
+
+  // Two warm-up draws that are thrown away. Measured by the determinism gate: the
+  // first draw of a scene that uses `applyPost` differs from the steady state
+  // (thousands of pixels, up to 13 levels in text areas); from the second draw on,
+  // everything is identical. Without the warm-up, frame 0 of every render carries that difference.
+  ctx.save();
+  try {
+    SCENE.draw(ctx, 0, SCENE.width, SCENE.height, AUDIO, IMAGES);
+    SCENE.draw(ctx, 0, SCENE.width, SCENE.height, AUDIO, IMAGES);
+  } finally {
+    ctx.restore();
+  }
+  await document.fonts.ready;
+};
+
+window.__meta = () => ({
+  name: SCENE.name, width: SCENE.width, height: SCENE.height, scale: SCALE,
+  fps: SCENE.fps, duration: SCENE.duration,
+  samples: SCENE.samples || 1, shutter: SCENE.shutter ?? 0.55,
+  soundtrack: SCENE.soundtrack || null,
+});
+
+// The scene's event timeline (if defined) — render.mjs writes it to out/SCENE.events.json
+// so a sound script reads it instead of duplicating constants.
+window.__events = () => {
+  const e = SCENE.events;
+  if (e == null) return null;
+  return typeof e === 'function' ? e() : e;
+};
+
+/**
+ * Real motion blur: because draw is a pure function of t, we can sample several
+ * moments inside the frame's shutter window and average them.
+ * The samples are summed in a float buffer and divided once (see below).
+ */
+window.__frame = (t, samples, shutter, fps) => {
+  if (!samples || samples <= 1) {
+    resetCTM();
+    SCENE.draw(ctx, t, SCENE.width, SCENE.height, AUDIO, IMAGES);
+    return c.toDataURL('image/png');
+  }
+  // Accumulate in FLOAT and round once. Averaging in the 8-bit canvas ('lighter' at alpha 1/N) truncates
+  // every sample — measured: a background of 10 came out as 8 at N=8, in every frame.
+  const sum = new Float32Array(acc.width * acc.height * 4);
+  for (let i = 0; i < samples; i++) {
+    const st = t + ((i + 0.5) / samples - 0.5) * (shutter / fps);
+    resetCTM();
+    SCENE.draw(ctx, st, SCENE.width, SCENE.height, AUDIO, IMAGES);
+    const d = rawCtx.getImageData(0, 0, acc.width, acc.height).data;
+    for (let k = 0; k < d.length; k++) sum[k] += d[k];
+  }
+  const out = actx.createImageData(acc.width, acc.height);
+  for (let k = 0; k < sum.length; k++) out.data[k] = Math.round(sum[k] / samples);
+  actx.putImageData(out, 0, 0);
+  return acc.toDataURL('image/png');
+};
+</script>
+</body>
+</html>

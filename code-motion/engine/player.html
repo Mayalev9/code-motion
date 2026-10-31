@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>code-motion · player</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0a0a0c; color:#e8e8ee;
+         font-family:-apple-system,"Helvetica Neue",Arial,sans-serif;
+         display:flex; flex-direction:column; align-items:center; gap:14px; padding:20px; }
+  h1 { font-size:14px; font-weight:500; opacity:.6; margin:0; letter-spacing:.02em; }
+  .scenes { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; max-width:640px; }
+  .scenes button { font-size:12px; padding:6px 11px; }
+  .scenes button[aria-current="true"] { background:#2f2a52; border-color:#4a3f86; color:#fff; }
+  canvas { max-height:min(66vh,700px); max-width:90vw; width:auto; height:auto; border-radius:14px; background:#000;
+           box-shadow:0 20px 60px rgba(0,0,0,.6); }
+  .custom { display:flex; gap:6px; }
+  .custom input { background:#1b1b21; color:#e8e8ee; border:1px solid #2c2c34;
+                  border-radius:8px; padding:7px 10px; font-size:13px; }
+  .bar { display:flex; align-items:center; gap:12px; width:min(38vh,400px); direction:ltr; }
+  input[type=range] { flex:1; accent-color:#5b8cff; }
+  button { background:#1b1b21; color:#e8e8ee; border:1px solid #2c2c34; border-radius:8px;
+           padding:7px 15px; font-size:13px; cursor:pointer; }
+  button:hover { background:#24242c; }
+  .t { font-variant-numeric:tabular-nums; opacity:.55; font-size:12px; min-width:70px; text-align:left; }
+</style>
+</head>
+<body>
+<h1>code-motion — every frame computed from code</h1>
+<div class="scenes" id="scenes"></div>
+<form class="custom" id="custom"><input id="sceneName" aria-label="Scene name" placeholder="Another scene name"><button>Load</button></form>
+<canvas id="c"></canvas>
+<div class="bar">
+  <button id="pp">⏸︎</button>
+  <input id="sc" type="range" min="0" max="1000" value="0">
+  <span class="t" id="tt">0.00s</span>
+</div>
+<script type="module">
+const NAMES = ['example'];   // add your scene names here — or type one in the box above
+
+const c = document.getElementById('c');
+const ctx = c.getContext('2d', { alpha:false });
+const sc = document.getElementById('sc'), tt = document.getElementById('tt'), pp = document.getElementById('pp');
+const bar = document.getElementById('scenes');
+
+let SCENE = null, AUDIO = null, IMAGES = {}, playing = true, t = 0, last = performance.now();
+let loadVersion = 0;
+// Soundtrack: when there is a `SCENE.soundtrack`, AUDIO TIME IS THE CLOCK (rAF is not a clock — they drift apart within seconds).
+// ⚠️ The player still draws one frame per screen refresh, without motion-blur sub-samples — the rendered file is the truth.
+let SND = null;
+const hint = msg => { tt.textContent = msg; };
+window.__player = { get snd() { return SND; }, get t() { return t; }, get playing() { return playing; } };  // for tests
+const loadedFonts = new Map();
+
+async function resource(src) {
+  const response = await fetch(src);
+  if (!response.ok) throw new Error(`${src}: HTTP ${response.status}`);
+  return response;
+}
+
+async function load(name) {
+  const version = ++loadVersion;
+  const nextImages = {};
+  let adopted = false;
+  try {
+    if (!/^[a-z0-9][a-z0-9-]*$/i.test(name)) throw new Error('invalid scene name');
+    const m = await import(`./scenes/${name}.js`);
+    const next = m.SCENE;
+    const nextAudio = next.audio ? await (await resource(next.audio)).json() : null;
+    for (const [key, src] of Object.entries(next.images || {})) {
+      nextImages[key] = await createImageBitmap(await (await resource(src)).blob());
+    }
+    for (const f of (next.fonts || [])) {
+      const key = `${f.family}\u0000${f.weight || '400'}\u0000${f.style || 'normal'}\u0000${f.src}`;
+      if (!loadedFonts.has(key)) {
+        const face = new FontFace(f.family, `url(${f.src})`,
+                                  { weight: f.weight || '400', style: f.style || 'normal' });
+        loadedFonts.set(key, face.load().then(() => document.fonts.add(face)));
+      }
+      await loadedFonts.get(key);
+    }
+    await document.fonts.ready;
+    if (version !== loadVersion) return;
+    for (const image of Object.values(IMAGES)) image.close();
+    if (SND) { SND.pause(); SND = null; }
+    if (next.soundtrack) {
+      SND = new Audio(next.soundtrack); SND.loop = true; SND.preload = 'auto';
+      if (playing) SND.play().catch(() => { playing = false; pp.textContent = '▶︎'; hint('🔇 The browser blocked playback — press ▶︎ to listen'); });
+    }
+    SCENE = next; AUDIO = nextAudio; IMAGES = nextImages;
+    adopted = true;
+    c.width = SCENE.width; c.height = SCENE.height;
+    t = 0; sc.value = 0;
+    for (const b of bar.children) b.setAttribute('aria-current', String(b.dataset.n === name));
+  } catch (error) {
+    if (version === loadVersion) tt.textContent = `Error: ${error.message}`;
+  } finally {
+    if (!adopted) for (const image of Object.values(nextImages)) image.close();
+  }
+}
+
+for (const n of NAMES) {
+  const b = document.createElement('button');
+  b.textContent = n; b.dataset.n = n;
+  b.onclick = () => load(n);
+  bar.appendChild(b);
+}
+document.getElementById('custom').addEventListener('submit', event => {
+  event.preventDefault();
+  load(document.getElementById('sceneName').value.trim());
+});
+
+function frame(now) {
+  if (SCENE) {
+    if (playing) {
+      t = SND && !SND.paused ? SND.currentTime % SCENE.duration : (t + (now - last) / 1000) % SCENE.duration;
+      sc.value = Math.round((t / SCENE.duration) * 1000);
+    }
+    try {
+      SCENE.draw(ctx, t, SCENE.width, SCENE.height, AUDIO, IMAGES);
+      if (!tt.textContent.startsWith('🔇') || playing) tt.textContent = t.toFixed(2) + 's' + (SND ? ' 🔊' : '');
+    } catch (error) {
+      SCENE = null; playing = false;
+      tt.textContent = `Error: ${error.message}`;
+    }
+  }
+  last = now;
+  requestAnimationFrame(frame);
+}
+sc.addEventListener('input', () => {
+  if (!SCENE) return;
+  playing = false; pp.textContent = '▶︎'; t = (sc.value / 1000) * SCENE.duration;
+  if (SND) { SND.pause(); SND.currentTime = t; }
+});
+pp.addEventListener('click', () => {
+  playing = !playing; pp.textContent = playing ? '⏸︎' : '▶︎';
+  if (!SND) return;
+  if (playing) { SND.currentTime = t; SND.play().catch(e => hint('Audio error: ' + e.message)); }
+  else SND.pause();
+});
+
+await load(NAMES[0]);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
